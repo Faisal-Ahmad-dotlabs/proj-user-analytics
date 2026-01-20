@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+.Python
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+.*.sw?
+
+# Data files (sensitive)
+*.csv
+*.json
+*.xlsx
+
+# Logs
+*.log
+
+# Environment
+.env
+
+# Cache
+.cache/

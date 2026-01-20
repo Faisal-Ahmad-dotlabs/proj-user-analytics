@@ -1,0 +1,35 @@
+[project]
+name = "dashboard"
+version = "0.1.0"
+description = ""
+authors = [ {name = "Ella",email = "developer@heloella.co"} ]
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic (>=2.12.5,<3.0.0)",
+    "pydantic-settings (>=2.12.0,<3.0.0)",
+    "requests (>=2.32.5,<3.0.0)",
+    "pandas (>=2.3.3,<3.0.0)",
+    "dash (>=3.3.0,<4.0.0)",
+    "plotly (>=6.5.2,<7.0.0)",
+    "dash-bootstrap-components (>=2.0.4,<3.0.0)"
+]
+
+[tool.poetry.scripts]
+dashboard = "dashboard.main:main"
+
+[tool.mypy]
+strict = "True"
+plugins = ["pydantic.mypy"]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[dependency-groups]
+dev = [
+    "mypy (>=1.19.1,<2.0.0)",
+    "ruff (>=0.14.13,<0.15.0)",
+    "types-requests (>=2.32.4.20260107,<3.0.0.0)",
+    "pandas-stubs (>=2.3.3.260113,<3.0.0.0)"
+]
