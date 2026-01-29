@@ -45,19 +45,63 @@ df = pd.DataFrame()
 # -----------------------------
 # HELPERS
 # -----------------------------
-def _pick_col(df_, candidates):
-    for c in candidates:
-        if c in df_.columns:
-            return c
+def find_column(df_, patterns):
+    """Return first matching column name from patterns (exact match)."""
+    for p in patterns:
+        if p in df_.columns:
+            return p
     return None
 
+def _pick_col(df_, candidates):
+    return find_column(df_, candidates)
+
 def get_content_id_col(df_):
-    return _pick_col(df_, ["properties.Content ID", "properties.content_id", "content_id", "properties.contentId"])
+    return find_column(df_, [
+        "properties.content_id",  # API format (most common)
+        "content_id",             # Mixpanel CSV export format
+        "properties.Content ID",
+        "properties.contentId",
+        "properties.ContentId",
+    ])
+
+def get_playback_percentage_col(df_):
+    return find_column(df_, [
+        "properties.playback.playback_percentage",  # API format (flattened)
+        "playback_percentage",                      # CSV parsed
+        "properties.playback_percentage",           # legacy flattened
+        "properties.Playback.Playback percentage",  # old CSV headers
+        "properties.Playback.Playback_percentage",
+    ])
+
+def get_playback_time_col(df_):
+    return find_column(df_, [
+        "properties.playback.playback_time",        # API format (flattened)
+        "playback_time",                            # CSV parsed
+        "properties.playback_time",                 # legacy flattened
+        "properties.Playback.Playback time",        # old CSV headers
+        "properties.Playback.Playback_time",
+    ])
+
+def get_session_id_col(df_):
+    return find_column(df_, [
+        "properties.session_id",     # API format
+        "session_id",                # CSV export format
+        "properties.Session ID",     # old CSV headers
+        "properties.SessionID",
+    ])
+
+def get_distinct_id_col(df_):
+    return find_column(df_, [
+        "properties.distinct_id",  # API format
+        "Distinct ID",             # Mixpanel CSV export format
+        "distinct_id",             # alternative CSV
+    ])
 
 def get_action_col(df_):
-    return _pick_col(df_, ["properties.action", "action", "properties.Action"])
+    return find_column(df_, ["properties.action", "action", "properties.Action"])
 
 def parse_time_to_seconds(time_str):
+    """Convert time string (MM:SS or HH:MM:SS) or numeric seconds to seconds."""
     if pd.isna(time_str) or time_str == "":
         return 0
     try:
@@ -75,14 +119,73 @@ def parse_time_to_seconds(time_str):
     except Exception:
         return 0
 
-def normalize_df_inplace(df_):
+def parse_playback_json(df_):
+    """Parse nested playback JSON in CSV exports into flat columns.
+
+    Mixpanel Export API data is already flattened by pd.json_normalize, so we leave it.
+    """
     if len(df_) == 0:
         return df_
-    if "properties.time" in df_.columns:
-        df_["datetime"] = pd.to_datetime(df_["properties.time"], unit="s", errors="coerce")
+
+    # If already flattened (Export API)
+    if "properties.playback.playback_percentage" in df_.columns or "properties.playback.playback_time" in df_.columns:
+        return df_
+
+    playback_col = find_column(df_, ["playback", "properties.playback"])
+    if playback_col is None:
+        return df_
+
+    def extract(val, key):
+        if pd.isna(val) or val == "":
+            return None
+        try:
+            if isinstance(val, str):
+                data = json.loads(val)
+            elif isinstance(val, dict):
+                data = val
+            else:
+                return None
+            return data.get(key)
+        except Exception:
+            return None
+
+    if "playback_percentage" not in df_.columns:
+        df_["playback_percentage"] = df_[playback_col].apply(lambda v: extract(v, "playback_percentage"))
+    if "playback_time" not in df_.columns:
+        df_["playback_time"] = df_[playback_col].apply(lambda v: extract(v, "playback_time"))
+
+    return df_
+
+def normalize_df_inplace(df_):
+    """Normalize Mixpanel Export API + Mixpanel CSV exports into a consistent schema."""
+    if len(df_) == 0:
+        return df_
+
+    # Mixpanel CSV export normalization (keep original cols but add API-like cols when missing)
+    csv_to_api_mapping = {
+        "Event Name": "event",
+        "Time": "properties.time",
+        "Distinct ID": "properties.distinct_id",
+        "City": "properties.$city",
+        "Operating System": "properties.$os",
+        "Country": "properties.$country",
+    }
+    for csv_name, api_name in csv_to_api_mapping.items():
+        if csv_name in df_.columns and api_name not in df_.columns:
+            df_[api_name] = df_[csv_name]
+
+    # datetime + date
+    time_col = find_column(df_, ["properties.time", "Time", "time"])
+    if time_col:
+        df_["datetime"] = pd.to_datetime(df_[time_col], unit="s", errors="coerce")
     else:
         df_["datetime"] = pd.NaT
+
     df_["date"] = pd.to_datetime(df_["datetime"].dt.date, errors="coerce")
+
+    # Playback JSON parsing for CSV exports
+    df_ = parse_playback_json(df_)
+
     return df_
 
 # -----------------------------
@@ -183,17 +286,20 @@ def list_saved_words_for_content(scope_df, content_id):
     return words
 
 def get_content_table_data(env_value: str, scope_df):
+    """Per content: max playback_percentage and max playback_time (from playback events only)."""
+
     cid_col = get_content_id_col(scope_df)
-    if cid_col is None:
+    pct_col = get_playback_percentage_col(scope_df)
+    time_col = get_playback_time_col(scope_df)
+
+    if cid_col is None or "event" not in scope_df.columns:
         return []
 
-    pct_col = _pick_col(scope_df, ["properties.Playback.Playback percentage"])
-    time_col = _pick_col(scope_df, ["properties.Playback.Playback time"])
+    playback_events = scope_df[scope_df["event"] == "playback"].copy()
+    if len(playback_events) == 0:
+        return []
 
-    playback_events = scope_df[scope_df[cid_col].notna()].copy()
-    if pct_col is not None:
-        playback_events = scope_df[scope_df[pct_col].notna()].copy()
-
+    playback_events = playback_events[playback_events[cid_col].notna()].copy()
     if len(playback_events) == 0:
         return []
 
@@ -206,22 +312,19 @@ def get_content_table_data(env_value: str, scope_df):
 
     rows = []
     for content_id in content_ids:
-        ce = playback_events[playback_events[cid_col] == content_id]
+        content_playback = playback_events[playback_events[cid_col] == content_id]
 
         max_progress = 0.0
-        if pct_col is not None and pct_col in ce.columns:
-            vals = ce[pct_col].dropna()
+        if pct_col and pct_col in content_playback.columns:
+            vals = pd.to_numeric(content_playback[pct_col], errors="coerce").dropna()
             if len(vals) > 0:
-                try:
-                    max_progress = float(vals.max())
-                except Exception:
-                    max_progress = 0.0
+                max_progress = float(vals.max())
 
         max_time_seconds = 0
-        if time_col is not None and time_col in ce.columns:
-            vals = ce[time_col].dropna()
-            if len(vals) > 0:
-                max_time_seconds = max([parse_time_to_seconds(t) for t in vals])
+        if time_col and time_col in content_playback.columns:
+            tvals = content_playback[time_col].dropna()
+            if len(tvals) > 0:
+                max_time_seconds = max([parse_time_to_seconds(t) for t in tvals])
 
         details = content_details.get(content_id, {})
         upload_date = "-"
@@ -232,38 +335,54 @@ def get_content_table_data(env_value: str, scope_df):
                 upload_date = "-"
 
         listen_url = f"https://helloella-prod.web.app/listen/{content_id}"
-        listen_md = f"[Open]({listen_url})"
-
-        title = details.get("title", f"Content {str(content_id)[:8]}...")
-        word_count = details.get("word_count", 0)
 
         rows.append({
             "content_id": content_id,
-            "title": title,
+            "title": details.get("title", f"Content {str(content_id)[:8]}..."),
             "type": details.get("type", "-"),
             "upload_date": upload_date,
-            "words": int(word_count or 0),
-            "progress": round(max_progress, 1) if max_progress > 0 else 0.0,
-            "playback_time": round(max_time_seconds / 60, 1) if max_time_seconds > 0 else 0.0,
+            "words": int(details.get("word_count", 0) or 0),
+            "progress": round(max_progress, 1),
+            "playback_time": round(max_time_seconds / 60, 1),
             "saved_words": int(saved_counts.get(content_id, 0)),
-            "listen_link": listen_md,
+            "listen_link": f"[Open]({listen_url})",
         })
 
     rows.sort(key=lambda x: x["progress"], reverse=True)
     return rows
 
+
 def calculate_content_metrics(env_value: str, scope_df):
+    """Aggregate content metrics using playback events only.
+
+    - total_contents: unique content_ids that have at least 1 playback event
+    - avg_progress: average of per-content max playback_percentage
+    - avg_playback_time: average of per-content max playback_time (minutes)
+    - total_words_completed: words * (max_progress/100) summed per content
+    """
+
+    default_metrics = {
+        "total_contents": 0,
+        "total_words_uploaded": 0,
+        "total_words_completed": 0,
+        "avg_progress": 0,
+        "avg_playback_time": 0,
+    }
+
+    if len(scope_df) == 0 or "event" not in scope_df.columns:
+        return default_metrics
+
     cid_col = get_content_id_col(scope_df)
     if cid_col is None:
-        return {"total_contents": 0, "total_words_uploaded": 0, "total_words_completed": "N/A", "avg_progress": 0, "avg_playback_time": 0}
+        return default_metrics
 
-    pct_col = _pick_col(scope_df, ["properties.Playback.Playback percentage"])
-    playback_events = scope_df[scope_df[cid_col].notna()].copy()
-    if pct_col is not None:
-        playback_events = scope_df[scope_df[pct_col].notna()].copy()
-
+    playback_events = scope_df[scope_df["event"] == "playback"].copy()
     if len(playback_events) == 0:
-        return {"total_contents": 0, "total_words_uploaded": 0, "total_words_completed": "N/A", "avg_progress": 0, "avg_playback_time": 0}
+        return default_metrics
+
+    playback_events = playback_events[playback_events[cid_col].notna()].copy()
+    if len(playback_events) == 0:
+        return default_metrics
 
     content_ids = playback_events[cid_col].dropna().unique().tolist()
     total_contents = int(len(content_ids))
@@ -271,91 +390,116 @@ def calculate_content_metrics(env_value: str, scope_df):
     content_details = ella.fetch_multiple_contents(env_value, content_ids)
     total_words_uploaded = int(sum([d.get("word_count", 0) or 0 for d in content_details.values()]))
 
+    pct_col = get_playback_percentage_col(playback_events)
+    time_col = get_playback_time_col(playback_events)
+
+    # Progress
+    max_progress_per_content = {}
+    if pct_col and pct_col in playback_events.columns:
+        playback_events[pct_col] = pd.to_numeric(playback_events[pct_col], errors="coerce")
+        for cid in content_ids:
+            vals = playback_events.loc[playback_events[cid_col] == cid, pct_col].dropna()
+            if len(vals) > 0:
+                max_progress_per_content[cid] = float(vals.max())
+
     avg_progress = 0.0
-    if pct_col is not None and pct_col in playback_events.columns:
-        try:
-            max_per_content = playback_events.groupby(cid_col)[pct_col].max()
-            avg_progress = float(max_per_content.mean()) if len(max_per_content) > 0 else 0.0
-        except Exception:
-            avg_progress = 0.0
+    total_words_completed = 0
+    if max_progress_per_content:
+        avg_progress = float(sum(max_progress_per_content.values()) / len(max_progress_per_content))
+        for cid, max_prog in max_progress_per_content.items():
+            wc = content_details.get(cid, {}).get("word_count", 0) or 0
+            total_words_completed += int(wc * (max_prog / 100.0))
+
+    # Playback time
+    max_time_per_content = {}
+    if time_col and time_col in playback_events.columns:
+        for cid in content_ids:
+            tvals = playback_events.loc[playback_events[cid_col] == cid, time_col].dropna()
+            if len(tvals) > 0:
+                max_secs = max([parse_time_to_seconds(t) for t in tvals])
+                if max_secs > 0:
+                    max_time_per_content[cid] = max_secs
 
     avg_playback_time = 0.0
-    pv = scope_df[scope_df["event"] == "page_view"].copy()
-    page_name_col = _pick_col(pv, ["properties.Page Name", "properties.page_name", "page_name"])
-    if len(pv) > 0 and len(pv) < 10000 and page_name_col is not None:
-        pv = pv.sort_values("datetime").reset_index(drop=True)
-        pv["next_datetime"] = pv["datetime"].shift(-1)
-        pv["next_page"] = pv[page_name_col].shift(-1)
-
-        listen_pages = pv[pv[page_name_col] == "Listen"].copy()
-        if len(listen_pages) > 0:
-            listen_pages["duration"] = (listen_pages["next_datetime"] - listen_pages["datetime"]).dt.total_seconds() / 60
-            valid = listen_pages[
-                (listen_pages["next_page"].notna()) &
-                (listen_pages["next_page"] != "Listen") &
-                (listen_pages["next_page"] != "Settings") &
-                (listen_pages["duration"] > 0) &
-                (listen_pages["duration"] < 180)
-            ]["duration"]
-            avg_playback_time = float(valid.mean()) if len(valid) > 0 else 0.0
+    if max_time_per_content:
+        avg_playback_time = float(sum(max_time_per_content.values()) / len(max_time_per_content) / 60.0)
 
     return {
         "total_contents": total_contents,
         "total_words_uploaded": total_words_uploaded,
-        "total_words_completed": "N/A",
+        "total_words_completed": int(total_words_completed),
         "avg_progress": round(avg_progress, 1) if avg_progress > 0 else 0,
         "avg_playback_time": round(avg_playback_time, 1) if avg_playback_time > 0 else 0,
     }
 
-# -----------------------------
-# SESSION TIMELINE
-# -----------------------------
+
 def create_session_timeline(scope_df, min_date, max_date, is_all_users=False):
-    if len(scope_df) == 0:
+    """Create sessions-per-day timeline with correct session counting across schema variants."""
+
+    if len(scope_df) == 0 or "date" not in scope_df.columns:
         fig = go.Figure()
         fig.update_layout(title="No session data available", height=400, plot_bgcolor="white", paper_bgcolor="white")
         return fig, 0, 0
 
-    scope_df = scope_df[(scope_df["date"] >= min_date) & (scope_df["date"] <= max_date)]
+    filtered_df = scope_df[(scope_df["date"] >= min_date) & (scope_df["date"] <= max_date)].copy()
+
+    session_col = get_session_id_col(filtered_df)
+    if session_col is None:
+        fig = go.Figure()
+        fig.update_layout(title="No session_id column found", height=400, plot_bgcolor="white", paper_bgcolor="white")
+        return fig, 0, 0
+
     all_dates = pd.date_range(start=min_date, end=max_date, freq="D")
     rows = []
 
-    for d in all_dates:
-        d_ts = pd.Timestamp(pd.to_datetime(d).date())
-        day = scope_df[scope_df["date"] == d_ts]
+    for date in all_dates:
+        date_ts = pd.Timestamp(date.date())
+        day_events = filtered_df[filtered_df["date"] == date_ts]
 
-        if len(day) == 0:
-            sessions = 0
-            total_time = "0 min"
-            avg_duration = "0 min"
-        else:
-            if "properties.Session ID" in day.columns:
-                st = day.groupby("properties.Session ID")["datetime"].agg(["min", "max"])
-                st["duration"] = (st["max"] - st["min"]).dt.total_seconds() / 60
-                sessions = int(len(st))
-                total = float(st["duration"].sum())
-                avg = float(total / sessions) if sessions > 0 else 0.0
-                total_time = f"{int(total)} min"
-                avg_duration = f"{int(avg)} min"
-            else:
-                sessions = 0
-                total_time = "0 min"
-                avg_duration = "0 min"
+        if len(day_events) == 0:
+            rows.append({"date": date_ts, "sessions": 0, "total_time": "0 min", "avg_duration": "0 min"})
+            continue
 
-        rows.append({"date": d_ts, "sessions": sessions, "total_time": total_time, "avg_duration": avg_duration})
+        sessions_today = day_events[session_col].dropna().unique()
+        num_sessions = int(len(sessions_today))
 
-    complete = pd.DataFrame(rows)
-    days_shown = len(complete)
-    total_days = (max_date - min_date).days + 1
+        if num_sessions == 0:
+            rows.append({"date": date_ts, "sessions": 0, "total_time": "0 min", "avg_duration": "0 min"})
+            continue
+
+        session_durations = []
+        for sid in sessions_today:
+            s_events = day_events[day_events[session_col] == sid]
+            if len(s_events) == 0:
+                continue
+            start = s_events["datetime"].min()
+            end = s_events["datetime"].max()
+            if pd.isna(start) or pd.isna(end):
+                continue
+            session_durations.append((end - start).total_seconds() / 60)
+
+        total_time = float(sum(session_durations))
+        avg_time = float(total_time / num_sessions) if num_sessions > 0 else 0.0
+
+        rows.append({
+            "date": date_ts,
+            "sessions": num_sessions,
+            "total_time": f"{int(total_time)} min",
+            "avg_duration": f"{int(avg_time)} min",
+        })
+
+    timeline_df = pd.DataFrame(rows)
+    days_shown = len(timeline_df)
+    total_days = int((max_date - min_date).days + 1)
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=complete["date"],
-        y=complete["sessions"],
+        x=timeline_df["date"],
+        y=timeline_df["sessions"],
         mode="lines+markers",
         line=dict(color="#7c3aed", width=2),
         marker=dict(size=8, color="#7c3aed"),
-        customdata=complete[["total_time", "avg_duration"]],
+        customdata=timeline_df[["total_time", "avg_duration"]],
         hovertemplate=(
             "<b>%{x|%b %d, %Y}</b><br>"
             "Sessions: %{y}<br>"
@@ -383,56 +527,61 @@ def create_session_timeline(scope_df, min_date, max_date, is_all_users=False):
 
     return fig, days_shown, total_days
 
+
 def get_session_details_with_content(env_value: str, scope_df, date_ts):
+    """Session details for a day. Content metrics computed from playback events only."""
+
+    if len(scope_df) == 0 or "date" not in scope_df.columns:
+        return []
+
     day_data = scope_df[scope_df["date"] == date_ts]
     if len(day_data) == 0:
         return []
 
+    session_col = get_session_id_col(day_data)
     cid_col = get_content_id_col(day_data)
-    pct_col = _pick_col(day_data, ["properties.Playback.Playback percentage"])
-    time_col = _pick_col(day_data, ["properties.Playback.Playback time"])
+
+    if session_col is None:
+        return []
+
+    pct_col = get_playback_percentage_col(day_data)
+    time_col = get_playback_time_col(day_data)
 
     sessions = []
-    if "properties.Session ID" not in day_data.columns:
-        return sessions
-
-    for session_id, session_data in day_data.groupby("properties.Session ID"):
+    for session_id, session_data in day_data.groupby(session_col):
         session_data = session_data.sort_values("datetime")
         start_time = session_data["datetime"].min()
         end_time = session_data["datetime"].max()
-        duration_mins = int((end_time - start_time).total_seconds() / 60)
+        duration_mins = int((end_time - start_time).total_seconds() / 60) if pd.notna(start_time) and pd.notna(end_time) else 0
 
-        event_counts = session_data["event"].value_counts().to_dict()
-        top_events = session_data["event"].value_counts().head(5).to_dict()
+        event_counts = session_data["event"].value_counts().to_dict() if "event" in session_data.columns else {}
+        top_events = session_data["event"].value_counts().head(5).to_dict() if "event" in session_data.columns else {}
 
         content_played = []
-        if cid_col is not None:
-            session_content = session_data[session_data[cid_col].notna()]
-            if len(session_content) > 0:
-                content_ids = session_content[cid_col].unique()
+        if cid_col is not None and "event" in session_data.columns:
+            session_playback = session_data[(session_data["event"] == "playback") & (session_data[cid_col].notna())]
+            if len(session_playback) > 0:
+                content_ids = session_playback[cid_col].unique().tolist()
                 content_details = ella.fetch_multiple_contents(env_value, content_ids)
 
                 for cid in content_ids:
-                    cid_events = session_content[session_content[cid_col] == cid].sort_values("datetime")
+                    cid_playback = session_playback[session_playback[cid_col] == cid].sort_values("datetime")
 
                     old_progress = 0.0
                     new_progress = 0.0
-                    if pct_col and pct_col in cid_events.columns:
-                        prog_vals = cid_events[pct_col].dropna()
+                    if pct_col and pct_col in cid_playback.columns:
+                        prog_vals = pd.to_numeric(cid_playback[pct_col], errors="coerce").dropna()
                         if len(prog_vals) > 0:
-                            try:
-                                old_progress = float(prog_vals.iloc[0])
-                                new_progress = float(prog_vals.iloc[-1])
-                            except Exception:
-                                pass
+                            old_progress = float(prog_vals.iloc[0])
+                            new_progress = float(prog_vals.iloc[-1])
 
                     progress_change = new_progress - old_progress
 
                     max_time_seconds = 0
-                    if time_col and time_col in cid_events.columns:
-                        time_vals = cid_events[time_col].dropna()
-                        if len(time_vals) > 0:
-                            max_time_seconds = max([parse_time_to_seconds(t) for t in time_vals])
+                    if time_col and time_col in cid_playback.columns:
+                        tvals = cid_playback[time_col].dropna()
+                        if len(tvals) > 0:
+                            max_time_seconds = max([parse_time_to_seconds(t) for t in tvals])
 
                     details = content_details.get(cid, {})
                     content_played.append({
@@ -446,8 +595,8 @@ def get_session_details_with_content(env_value: str, scope_df, date_ts):
 
         sessions.append({
             "session_id": session_id,
-            "start_time": start_time.strftime("%H:%M"),
-            "end_time": end_time.strftime("%H:%M"),
+            "start_time": start_time.strftime("%H:%M") if pd.notna(start_time) else "N/A",
+            "end_time": end_time.strftime("%H:%M") if pd.notna(end_time) else "N/A",
             "duration": duration_mins,
             "event_count": int(len(session_data)),
             "event_types": int(len(event_counts)),
@@ -458,69 +607,75 @@ def get_session_details_with_content(env_value: str, scope_df, date_ts):
     sessions.sort(key=lambda x: x["start_time"])
     return sessions
 
+
 def get_content_history(scope_df, content_id, date_filter="month"):
+    """Daily history for a content based on playback events only.
+
+    Returns:
+      history_df: date, max_progress, playback_time_minutes
+      summary: overall_max_progress, total_playback_time_minutes, days_interacted, total_days
+    """
+
     cid_col = get_content_id_col(scope_df)
-    if cid_col is None:
+    if cid_col is None or "event" not in scope_df.columns or "date" not in scope_df.columns:
         return pd.DataFrame(), {}
 
-    content_events = scope_df[scope_df[cid_col] == content_id].copy()
-    if len(content_events) == 0:
+    content_playback = scope_df[(scope_df["event"] == "playback") & (scope_df[cid_col] == content_id)].copy()
+    if len(content_playback) == 0:
         return pd.DataFrame(), {}
 
-    pct_col = _pick_col(content_events, ["properties.Playback.Playback percentage"])
-    time_col = _pick_col(content_events, ["properties.Playback.Playback time"])
+    pct_col = get_playback_percentage_col(content_playback)
+    time_col = get_playback_time_col(content_playback)
 
-    max_date = content_events["date"].max()
+    max_date = content_playback["date"].max()
+    if pd.isna(max_date):
+        return pd.DataFrame(), {}
+
     if date_filter == "week":
         min_date = max_date - timedelta(days=6)
     else:
         min_date = max_date - timedelta(days=29)
 
     all_dates = pd.date_range(start=min_date, end=max_date, freq="D")
-    daily_data = {}
+    daily_rows = []
 
     for date in all_dates:
         date_ts = pd.Timestamp(date.date())
-        day_events = content_events[content_events["date"] == date_ts]
+        day_playback = content_playback[content_playback["date"] == date_ts]
 
         max_progress = 0.0
-        if len(day_events) > 0 and pct_col and pct_col in day_events.columns:
-            prog_vals = day_events[pct_col].dropna()
-            if len(prog_vals) > 0:
-                try:
-                    max_progress = float(prog_vals.max())
-                except Exception:
-                    pass
+        if len(day_playback) > 0 and pct_col and pct_col in day_playback.columns:
+            vals = pd.to_numeric(day_playback[pct_col], errors="coerce").dropna()
+            if len(vals) > 0:
+                max_progress = float(vals.max())
 
         playback_time_seconds = 0
-        if len(day_events) > 0 and time_col and time_col in day_events.columns:
-            time_vals = day_events[time_col].dropna()
-            if len(time_vals) > 0:
-                playback_time_seconds = max([parse_time_to_seconds(t) for t in time_vals])
+        if len(day_playback) > 0 and time_col and time_col in day_playback.columns:
+            tvals = day_playback[time_col].dropna()
+            if len(tvals) > 0:
+                playback_time_seconds = max([parse_time_to_seconds(t) for t in tvals])
 
-        daily_data[date_ts] = {
+        daily_rows.append({
             "date": date_ts,
             "max_progress": max_progress,
-            "playback_time_minutes": playback_time_seconds / 60,
-        }
+            "playback_time_minutes": playback_time_seconds / 60.0,
+        })
 
-    all_progress_vals = [v["max_progress"] for v in daily_data.values() if v["max_progress"] > 0]
-    all_time_vals = [v["playback_time_minutes"] for v in daily_data.values() if v["playback_time_minutes"] > 0]
+    history_df = pd.DataFrame(daily_rows).sort_values("date")
+
+    all_progress_vals = history_df.loc[history_df["max_progress"] > 0, "max_progress"].tolist()
+    all_time_vals = history_df.loc[history_df["playback_time_minutes"] > 0, "playback_time_minutes"].tolist()
 
     summary = {
         "overall_max_progress": round(max(all_progress_vals), 1) if all_progress_vals else 0.0,
         "total_playback_time_minutes": round(sum(all_time_vals), 1) if all_time_vals else 0.0,
-        "days_interacted": len([v for v in daily_data.values() if v["max_progress"] > 0 or v["playback_time_minutes"] > 0]),
-        "total_days": len(all_dates),
+        "days_interacted": int(len(history_df[(history_df["max_progress"] > 0) | (history_df["playback_time_minutes"] > 0)])),
+        "total_days": int(len(all_dates)),
     }
 
-    history_df = pd.DataFrame(list(daily_data.values())).sort_values("date")
     return history_df, summary
 
 
-# -----------------------------
-# LANGUAGE HELPERS
-# -----------------------------
 def get_user_languages(user_df) -> tuple[str, str]:
     selector_events = user_df[
         (user_df["event"] == "selector") &
@@ -1130,10 +1285,12 @@ def update_dashboard(user_id, date_range, custom_start, custom_end, content_date
     content_metrics = calculate_content_metrics(env_value, content_df)
     table_data = get_content_table_data(env_value, content_df)
 
-    if len(table_data) > 0:
-        content_table = dash_table.DataTable(
+    # Content table (always render DataTable so downstream callbacks don't break)
+    content_table = html.Div([
+        dbc.Alert("No content data available.", color="light", style={"marginBottom": "10px"}) if len(table_data) == 0 else html.Div(),
+        dash_table.DataTable(
             id="content-table",
-            data=table_data,
+            data=table_data if len(table_data) > 0 else [],
             columns=[
                 {"name": "Title", "id": "title"},
                 {"name": "Type", "id": "type"},
@@ -1150,10 +1307,7 @@ def update_dashboard(user_id, date_range, custom_start, custom_end, content_date
             row_selectable=False,
             selected_rows=[],
             active_cell=None,
-            style_table={
-                "overflowX": "auto",
-                "minWidth": "100%",
-            },
+            style_table={"overflowX": "auto", "minWidth": "100%"},
             style_header={
                 "backgroundColor": "#f9fafb",
                 "fontWeight": "800",
@@ -1183,9 +1337,7 @@ def update_dashboard(user_id, date_range, custom_start, custom_end, content_date
             sort_action="native",
             filter_action="native",
         )
-    else:
-        content_table = html.Div([html.P("No content data available.", style={"color": "#6b7280", "textAlign": "center", "padding": "18px"})])
-
+        ])
     max_date = scope_df["date"].max() if "date" in scope_df.columns else pd.Timestamp(datetime.now().date())
     if date_range == "custom" and custom_start and custom_end:
         min_date = pd.Timestamp(pd.to_datetime(custom_start).date())
