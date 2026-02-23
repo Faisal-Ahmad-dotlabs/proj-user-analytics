@@ -100,6 +100,14 @@ def get_distinct_id_col(df_):
 def get_action_col(df_):
     return find_column(df_, ["properties.action", "action", "properties.Action"])
 
+def get_user_id_col(df_):
+    return find_column(df_, [
+        "properties.$user_id",   # Mixpanel identified user
+        "properties.user_id",    # alternative
+        "$user_id",              # CSV export
+        "user_id",               # generic
+    ])
+
 def parse_time_to_seconds(time_str):
     """Convert time string (MM:SS or HH:MM:SS) or numeric seconds to seconds."""
     if pd.isna(time_str) or time_str == "":
@@ -204,21 +212,46 @@ def setup() -> None:
 
 
 def update_user_dropdown_options():
-    """Update dropdown with distinct_id only"""
+    """Update dropdown with distinct_id and user_id (when available).
+
+    The dropdown *value* is always the distinct_id so existing filtering logic
+    is unchanged. The *label* includes both IDs so Dash's built-in text search
+    works for either identifier.
+    """
     if len(df) == 0:
         return [{"label": "All users", "value": ALL_USERS_VALUE}]
 
-    col = _pick_col(df, ["properties.distinct_id", "distinct_id"])
-    if not col:
+    distinct_col = _pick_col(df, ["properties.distinct_id", "distinct_id"])
+    if not distinct_col:
         return [{"label": "All users", "value": ALL_USERS_VALUE}]
 
-    unique_users = sorted(df[col].dropna().unique().tolist())
+    uid_col = get_user_id_col(df)
+
+    # Build a mapping: distinct_id -> most-common non-null user_id (if any)
+    uid_map: dict[str, str] = {}
+    if uid_col:
+        for did, group in df.groupby(distinct_col):
+            uids = group[uid_col].dropna().astype(str)
+            uids = uids[uids != ""]
+            if len(uids) > 0:
+                uid_map[str(did)] = str(uids.mode().iloc[0])
+
+    unique_users = sorted(df[distinct_col].dropna().unique().tolist())
     opts = [{"label": "All users", "value": ALL_USERS_VALUE}]
 
-    for user_id in unique_users:
-        user_id_str = str(user_id)
-        label = (user_id_str[:80] + "...") if len(user_id_str) > 80 else user_id_str
-        opts.append({"label": label, "value": str(user_id)})
+    for did in unique_users:
+        did_str = str(did)
+        uid_str = uid_map.get(did_str)
+
+        if uid_str:
+            # Show user_id prominently; include distinct_id for search/reference
+            did_short = (did_str[:40] + "…") if len(did_str) > 40 else did_str
+            uid_short = (uid_str[:40] + "…") if len(uid_str) > 40 else uid_str
+            label = f"{uid_short}  [{did_short}]"
+        else:
+            label = (did_str[:80] + "…") if len(did_str) > 80 else did_str
+
+        opts.append({"label": label, "value": did_str})
 
     return opts
 
@@ -852,7 +885,7 @@ app.layout = html.Div([
         html.Div([
             dbc.Row([
                 dbc.Col([
-                    html.Label("Select user (Distinct ID)", style={"fontWeight": "700", "fontSize": "12px", "color": "#374151"}),
+                    html.Label("Select user (Distinct ID / User ID)", style={"fontWeight": "700", "fontSize": "12px", "color": "#374151"}),
                     dcc.Dropdown(
                         id="user-dropdown",
                         options=user_dropdown_options,
@@ -1108,26 +1141,62 @@ def display_selected_user_id(user_id):
     if not user_id or user_id == ALL_USERS_VALUE:
         return html.Div()
 
+    # Look up the associated user_id for this distinct_id
+    uid_str = None
+    if len(df) > 0:
+        distinct_col = _pick_col(df, ["properties.distinct_id", "distinct_id"])
+        uid_col = get_user_id_col(df)
+        if distinct_col and uid_col:
+            rows = df[df[distinct_col].astype(str) == str(user_id)][uid_col].dropna().astype(str)
+            rows = rows[rows != ""]
+            if len(rows) > 0:
+                uid_str = str(rows.mode().iloc[0])
+
+    id_rows = [
+        html.Div([
+            html.Span("Distinct ID: ", style={"fontWeight": "700", "color": "#374151", "fontSize": "11px"}),
+            html.Code(
+                str(user_id),
+                style={
+                    "backgroundColor": "#f3f4f6",
+                    "padding": "4px 8px",
+                    "borderRadius": "4px",
+                    "fontSize": "11px",
+                    "color": "#111827",
+                    "userSelect": "all",
+                    "cursor": "text",
+                    "fontFamily": "monospace",
+                    "wordBreak": "break-all",
+                }
+            ),
+        ]),
+    ]
+
+    if uid_str:
+        id_rows.append(html.Div([
+            html.Span("User ID: ", style={"fontWeight": "700", "color": "#374151", "fontSize": "11px"}),
+            html.Code(
+                uid_str,
+                style={
+                    "backgroundColor": "#e0f2fe",
+                    "padding": "4px 8px",
+                    "borderRadius": "4px",
+                    "fontSize": "11px",
+                    "color": "#0369a1",
+                    "userSelect": "all",
+                    "cursor": "text",
+                    "fontFamily": "monospace",
+                    "wordBreak": "break-all",
+                }
+            ),
+        ], style={"marginTop": "6px"}))
+
     return html.Div([
-        dbc.Alert([
-            html.Div([
-                html.Span("Distinct ID: ", style={"fontWeight": "700", "color": "#374151", "fontSize": "11px"}),
-                html.Code(
-                    str(user_id),
-                    style={
-                        "backgroundColor": "#f3f4f6",
-                        "padding": "4px 8px",
-                        "borderRadius": "4px",
-                        "fontSize": "11px",
-                        "color": "#111827",
-                        "userSelect": "all",
-                        "cursor": "text",
-                        "fontFamily": "monospace",
-                        "wordBreak": "break-all"
-                    }
-                ),
-            ]),
-        ], color="light", style={"padding": "10px", "marginBottom": "0", "border": "1px solid #e5e7eb"})
+        dbc.Alert(
+            html.Div(id_rows),
+            color="light",
+            style={"padding": "10px", "marginBottom": "0", "border": "1px solid #e5e7eb"},
+        )
     ])
 
 @app.callback(
