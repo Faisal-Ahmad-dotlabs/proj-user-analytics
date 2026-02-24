@@ -1629,12 +1629,13 @@ def update_content_date_filter(week_clicks, month_clicks):
 
 @app.callback(
     Output("session-details-container", "children"),
-    [Input("session-timeline", "clickData"), Input("current-user-store", "data"), Input("env-store", "data")],
+    [Input("session-timeline", "clickData")],
+    [State("current-user-store", "data"), State("env-store", "data")],
     prevent_initial_call=True,
 )
 def display_session_details(clickData, current_user_value, env_value):
     if clickData is None:
-        return html.Div()
+        return dash.no_update
 
     clicked_date = pd.Timestamp(pd.to_datetime(clickData["points"][0]["x"]).date())
 
