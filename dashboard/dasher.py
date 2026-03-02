@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 settings = config.get_app_settings()
 
 ALL_USERS_VALUE = "__ALL__"
+MULTI_USER_PREFIX = "__MULTI__"
 
 ENV_OPTIONS = [
     {"label": "Dev", "value": "dev"},
@@ -41,6 +42,7 @@ app.title = "Ella User Analytics Dashboard"
 app.config.suppress_callback_exceptions = True
 
 df = pd.DataFrame()
+uid_to_dids: dict[str, list[str]] = {}  # user_id -> sorted list of distinct_ids
 
 # -----------------------------
 # HELPERS
@@ -214,48 +216,110 @@ def setup() -> None:
 def update_user_dropdown_options():
     """Update dropdown with distinct_id and user_id (when available).
 
-    The dropdown *value* is always the distinct_id so existing filtering logic
-    is unchanged. The *label* includes both IDs so Dash's built-in text search
-    works for either identifier.
+    For user_ids with more than one distinct_id, inserts a combined option whose
+    value is  MULTI_USER_PREFIX + user_id  (e.g. "__MULTI__UWtdc...").
+    Selecting it aggregates ALL associated distinct_ids in the dashboard.
+
+    Individual per-distinct_id options are still shown, labelled as:
+        "user_id ( did_short )"
     """
+    global uid_to_dids
+
     if len(df) == 0:
+        uid_to_dids = {}
         return [{"label": "All users", "value": ALL_USERS_VALUE}]
 
     distinct_col = _pick_col(df, ["properties.distinct_id", "distinct_id"])
     if not distinct_col:
+        uid_to_dids = {}
         return [{"label": "All users", "value": ALL_USERS_VALUE}]
 
     uid_col = get_user_id_col(df)
 
-    # Build a mapping: distinct_id -> most-common non-null user_id (if any)
-    uid_map: dict[str, str] = {}
+    # Build mapping: user_id -> sorted list of distinct_ids, and reverse
+    uid_to_dids = {}
+    did_to_uid: dict[str, str] = {}
+
     if uid_col:
         for did, group in df.groupby(distinct_col):
             uids = group[uid_col].dropna().astype(str)
             uids = uids[uids != ""]
             if len(uids) > 0:
-                uid_map[str(did)] = str(uids.mode().iloc[0])
+                uid_str = str(uids.mode().iloc[0])
+                did_str = str(did)
+                did_to_uid[did_str] = uid_str
+                uid_to_dids.setdefault(uid_str, [])
+                if did_str not in uid_to_dids[uid_str]:
+                    uid_to_dids[uid_str].append(did_str)
 
-    unique_users = sorted(df[distinct_col].dropna().unique().tolist())
+    for uid in uid_to_dids:
+        uid_to_dids[uid] = sorted(uid_to_dids[uid])
+
+    def _short(s: str, n: int = 40) -> str:
+        return (s[:n] + "…") if len(s) > n else s
+
+    unique_dids = sorted(df[distinct_col].dropna().unique().tolist(), key=str)
     opts = [{"label": "All users", "value": ALL_USERS_VALUE}]
 
-    for did in unique_users:
+    combined_added: set[str] = set()
+
+    for did in unique_dids:
         did_str = str(did)
-        uid_str = uid_map.get(did_str)
+        uid_str = did_to_uid.get(did_str)
 
         if uid_str:
-            # Show user_id prominently; include distinct_id for search/reference
-            did_short = (did_str[:40] + "…") if len(did_str) > 40 else did_str
-            uid_short = (uid_str[:40] + "…") if len(uid_str) > 40 else uid_str
-            label = f"{uid_short}  [{did_short}]"
-        else:
-            label = (did_str[:80] + "…") if len(did_str) > 80 else did_str
+            dids_for_uid = uid_to_dids.get(uid_str, [did_str])
+            uid_short = _short(uid_str)
 
-        opts.append({"label": label, "value": did_str})
+            # Insert combined option once when ≥2 distinct_ids share this user_id
+            if uid_str not in combined_added and len(dids_for_uid) > 1:
+                dids_label = ", ".join(_short(d, 36) for d in dids_for_uid)
+                combined_label = f"{uid_short} ( {dids_label} )"
+                opts.append({
+                    "label": combined_label,
+                    "value": MULTI_USER_PREFIX + uid_str,
+                })
+                combined_added.add(uid_str)
+
+            # Individual option for this distinct_id
+            did_short = _short(did_str, 36)
+            if len(dids_for_uid) > 1:
+                label = f"{uid_short} ( {did_short} )"
+            else:
+                label = f"{uid_short}  [{did_short}]"
+            opts.append({"label": label, "value": did_str})
+
+        else:
+            label = _short(did_str, 80)
+            opts.append({"label": label, "value": did_str})
 
     return opts
 
+def get_scope_df(df_: pd.DataFrame, selected_value: str) -> tuple[pd.DataFrame, bool]:
+    """Return (filtered_df, is_all_users) for a given dropdown value.
 
+    Handles three cases:
+      ALL_USERS_VALUE         -> entire dataframe
+      MULTI_USER_PREFIX + uid -> rows for ALL distinct_ids linked to that user_id
+      <distinct_id>           -> rows for that single distinct_id
+    """
+    if not selected_value or selected_value == ALL_USERS_VALUE:
+        return df_.copy(), True
+
+    distinct_col = _pick_col(df_, ["properties.distinct_id", "distinct_id"])
+
+    if selected_value.startswith(MULTI_USER_PREFIX):
+        uid = selected_value[len(MULTI_USER_PREFIX):]
+        dids = uid_to_dids.get(uid, [])
+        if not dids or distinct_col is None:
+            return pd.DataFrame(), False
+        mask = df_[distinct_col].astype(str).isin([str(d) for d in dids])
+        return df_[mask].copy(), False
+
+    # Single distinct_id
+    if distinct_col is None:
+        return df_.copy(), False
+    return df_[df_[distinct_col].astype(str) == str(selected_value)].copy(), False
 user_dropdown_options = update_user_dropdown_options()
 
 min_date_data = (
@@ -1141,7 +1205,48 @@ def display_selected_user_id(user_id):
     if not user_id or user_id == ALL_USERS_VALUE:
         return html.Div()
 
-    # Look up the associated user_id for this distinct_id
+    code_style = {
+        "backgroundColor": "#f3f4f6",
+        "padding": "4px 8px",
+        "borderRadius": "4px",
+        "fontSize": "11px",
+        "color": "#111827",
+        "userSelect": "all",
+        "cursor": "text",
+        "fontFamily": "monospace",
+        "wordBreak": "break-all",
+    }
+    uid_code_style = {**code_style, "backgroundColor": "#e0f2fe", "color": "#0369a1"}
+
+    # ── MULTI selection (combined user_id option) ──────────────────────────
+    if user_id.startswith(MULTI_USER_PREFIX):
+        uid_str = user_id[len(MULTI_USER_PREFIX):]
+        dids = uid_to_dids.get(uid_str, [])
+        id_rows = [
+            html.Div([
+                html.Span("User ID: ", style={"fontWeight": "700", "color": "#374151", "fontSize": "11px"}),
+                html.Code(uid_str, style=uid_code_style),
+                html.Span(
+                    " (aggregated — all distinct IDs)",
+                    style={"fontSize": "11px", "color": "#6b7280", "marginLeft": "6px"},
+                ),
+            ]),
+        ]
+        for i, did in enumerate(dids):
+            id_rows.append(html.Div([
+                html.Span(f"Distinct ID {i + 1}: ", style={"fontWeight": "700", "color": "#374151", "fontSize": "11px"}),
+                html.Code(did, style=code_style),
+            ], style={"marginTop": "6px"}))
+
+        return html.Div([
+            dbc.Alert(
+                html.Div(id_rows),
+                color="light",
+                style={"padding": "10px", "marginBottom": "0", "border": "1px solid #e5e7eb"},
+            )
+        ])
+
+    # ── Single distinct_id selection ───────────────────────────────────────
     uid_str = None
     if len(df) > 0:
         distinct_col = _pick_col(df, ["properties.distinct_id", "distinct_id"])
@@ -1155,40 +1260,14 @@ def display_selected_user_id(user_id):
     id_rows = [
         html.Div([
             html.Span("Distinct ID: ", style={"fontWeight": "700", "color": "#374151", "fontSize": "11px"}),
-            html.Code(
-                str(user_id),
-                style={
-                    "backgroundColor": "#f3f4f6",
-                    "padding": "4px 8px",
-                    "borderRadius": "4px",
-                    "fontSize": "11px",
-                    "color": "#111827",
-                    "userSelect": "all",
-                    "cursor": "text",
-                    "fontFamily": "monospace",
-                    "wordBreak": "break-all",
-                }
-            ),
+            html.Code(str(user_id), style=code_style),
         ]),
     ]
 
     if uid_str:
         id_rows.append(html.Div([
             html.Span("User ID: ", style={"fontWeight": "700", "color": "#374151", "fontSize": "11px"}),
-            html.Code(
-                uid_str,
-                style={
-                    "backgroundColor": "#e0f2fe",
-                    "padding": "4px 8px",
-                    "borderRadius": "4px",
-                    "fontSize": "11px",
-                    "color": "#0369a1",
-                    "userSelect": "all",
-                    "cursor": "text",
-                    "fontFamily": "monospace",
-                    "wordBreak": "break-all",
-                }
-            ),
+            html.Code(uid_str, style=uid_code_style),
         ], style={"marginTop": "6px"}))
 
     return html.Div([
@@ -1282,17 +1361,8 @@ def update_dashboard(user_id, date_range, custom_start, custom_end, content_date
             user_id,
         )
 
+    scope_df, is_all_users = get_scope_df(df, user_id)
     distinct_id_col = _pick_col(df, ["properties.distinct_id", "distinct_id"])
-
-    if user_id == ALL_USERS_VALUE:
-        scope_df = df.copy()
-        is_all_users = True
-    else:
-        if distinct_id_col:
-            scope_df = df[df[distinct_id_col].astype(str) == str(user_id)].copy()
-        else:
-            scope_df = df.copy()
-        is_all_users = False
 
     if len(scope_df) == 0:
         empty_table = html.Div([html.P("No data for selected user.", style={"color": "#6b7280", "textAlign": "center", "padding": "18px"})])
@@ -1491,14 +1561,7 @@ def show_content_details(selected_content_id, current_user_value, date_filter, e
     if not selected_content_id:
         return html.Div()
 
-    if current_user_value == ALL_USERS_VALUE:
-        scope_df = df.copy()
-    else:
-        distinct_id_col = _pick_col(df, ["properties.distinct_id", "distinct_id"])
-        if distinct_id_col:
-            scope_df = df[df[distinct_id_col].astype(str) == str(current_user_value)].copy()
-        else:
-            scope_df = df.copy()
+    scope_df, _ = get_scope_df(df, current_user_value)
 
     history_df, summary = get_content_history(scope_df, selected_content_id, date_filter)
     if len(history_df) == 0:
@@ -1639,14 +1702,7 @@ def display_session_details(clickData, current_user_value, env_value):
 
     clicked_date = pd.Timestamp(pd.to_datetime(clickData["points"][0]["x"]).date())
 
-    if current_user_value == ALL_USERS_VALUE:
-        scope_df = df.copy()
-    else:
-        distinct_id_col = _pick_col(df, ["properties.distinct_id", "distinct_id"])
-        if distinct_id_col:
-            scope_df = df[df[distinct_id_col].astype(str) == str(current_user_value)].copy()
-        else:
-            scope_df = df.copy()
+    scope_df, _ = get_scope_df(df, current_user_value)
 
     sessions = get_session_details_with_content(env_value, scope_df, clicked_date)
 
