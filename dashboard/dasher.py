@@ -344,21 +344,30 @@ def count_saved_words_by_content(scope_df):
         return {}
 
     sw = scope_df[scope_df["event"] == "saved_words"].copy()
-    if len(sw) == 0:
+    if sw.empty:
         return {}
 
     action_col = get_action_col(sw)
-    if action_col is not None:
-        sw[action_col] = sw[action_col].astype(str)
-        sw = sw[sw[action_col].str.lower() == "add"]
-
     word_col = _pick_col(sw, ["properties.word", "word", "properties.Word"])
-    if word_col is None:
-        counts = sw.groupby(cid_col).size().to_dict()
-        return {k: int(v) for k, v in counts.items()}
+    insert_col = "properties.$insert_id"
 
-    sw[word_col] = sw[word_col].astype(str)
-    counts = sw.groupby(cid_col)[word_col].nunique().to_dict()
+    if action_col is None or word_col is None:
+        return {}
+
+    # Keep only add actions
+    sw[action_col] = sw[action_col].astype(str)
+    sw = sw[sw[action_col].str.lower() == "add"]
+
+    if sw.empty:
+        return {}
+
+    # Ensure each Mixpanel event counted once
+    if insert_col in sw.columns:
+        sw = sw.drop_duplicates(subset=[insert_col])
+
+    # Count word events per content_id
+    counts = sw.groupby(cid_col)[word_col].size().to_dict()
+
     return {k: int(v) for k, v in counts.items()}
 
 def list_saved_words_for_content(scope_df, content_id):
@@ -384,7 +393,6 @@ def list_saved_words_for_content(scope_df, content_id):
 
 def get_content_table_data(env_value: str, scope_df):
     """Per content: max playback_percentage and max playback_time (from playback events only)."""
-
     cid_col = get_content_id_col(scope_df)
     pct_col = get_playback_percentage_col(scope_df)
     time_col = get_playback_time_col(scope_df)
@@ -430,8 +438,11 @@ def get_content_table_data(env_value: str, scope_df):
                 upload_date = pd.to_datetime(details["upload_date"]).strftime("%Y-%m-%d")
             except Exception:
                 upload_date = "-"
-
-        listen_url = f"https://helloella-prod.web.app/listen/{content_id}"
+        if env_value == "prod":
+            base_listen_url = "https://helloella-prod.web.app"
+        else:
+            base_listen_url = "https://helloella-test.web.app"
+        listen_url = f"{base_listen_url}/listen/{content_id}"
 
         rows.append({
             "content_id": content_id,
@@ -462,8 +473,8 @@ def calculate_content_metrics(env_value: str, scope_df):
         "total_contents": 0,
         "total_words_uploaded": 0,
         "total_words_completed": 0,
-        "avg_progress": 0,
-        "avg_playback_time": 0,
+        "total_playback_percentage": 0,
+        "total_consumption_playback_time": 0,
     }
 
     if len(scope_df) == 0 or "event" not in scope_df.columns:
@@ -499,13 +510,15 @@ def calculate_content_metrics(env_value: str, scope_df):
             if len(vals) > 0:
                 max_progress_per_content[cid] = float(vals.max())
 
-    avg_progress = 0.0
+    total_playback_percentage = 0.0
     total_words_completed = 0
     if max_progress_per_content:
-        avg_progress = float(sum(max_progress_per_content.values()) / len(max_progress_per_content))
         for cid, max_prog in max_progress_per_content.items():
             wc = content_details.get(cid, {}).get("word_count", 0) or 0
             total_words_completed += int(wc * (max_prog / 100.0))
+    if total_words_uploaded > 0:
+        total_playback_percentage = (total_words_completed / total_words_uploaded) * 100.0
+    
 
     # Playback time
     max_time_per_content = {}
@@ -517,16 +530,17 @@ def calculate_content_metrics(env_value: str, scope_df):
                 if max_secs > 0:
                     max_time_per_content[cid] = max_secs
 
-    avg_playback_time = 0.0
+    total_consumption_playback_time = 0.0
     if max_time_per_content:
-        avg_playback_time = float(sum(max_time_per_content.values()) / len(max_time_per_content) / 60.0)
+        total_consumption_playback_time = float(sum(max_time_per_content.values()) / 60.0)
+
 
     return {
         "total_contents": total_contents,
         "total_words_uploaded": total_words_uploaded,
         "total_words_completed": int(total_words_completed),
-        "avg_progress": round(avg_progress, 1) if avg_progress > 0 else 0,
-        "avg_playback_time": round(avg_playback_time, 1) if avg_playback_time > 0 else 0,
+        "total_playback_percentage": round(total_playback_percentage, 1) if total_playback_percentage > 0 else 0,
+        "total_consumption_playback_time": round(total_consumption_playback_time, 1) if total_consumption_playback_time > 0 else 0,
     }
 
 
@@ -705,7 +719,7 @@ def get_session_details_with_content(env_value: str, scope_df, date_ts):
     return sessions
 
 
-def get_content_history(scope_df, content_id, date_filter="month"):
+def get_content_history(scope_df, content_id, date_filter="month", global_max_date=None):
     """Daily history for a content based on playback events only.
 
     Returns:
@@ -724,7 +738,8 @@ def get_content_history(scope_df, content_id, date_filter="month"):
     pct_col = get_playback_percentage_col(content_playback)
     time_col = get_playback_time_col(content_playback)
 
-    max_date = content_playback["date"].max()
+    max_date = global_max_date if global_max_date else content_playback["date"].max()
+    # max_date = content_playback["date"].max()
     if pd.isna(max_date):
         return pd.DataFrame(), {}
 
@@ -1025,14 +1040,21 @@ app.layout = html.Div([
             dbc.Row([
                 dbc.Col([
                     html.Div([
-                        html.Div("Avg progress", style={"fontSize": "12px", "color": "#f59e0b", "fontWeight": "800"}),
-                        html.Div(id="metric-avg-progress", style={"fontSize": "28px", "fontWeight": "900", "color": "#111827"}),
+                        html.Div("Total playback percentage", style={"fontSize": "12px", "color": "#f59e0b", "fontWeight": "800"}),
+                        html.Div(id="metric-total-playback-percentage", style={"fontSize": "28px", "fontWeight": "900", "color": "#111827"}),
+
+
+                        # html.Div("Avg progress", style={"fontSize": "12px", "color": "#f59e0b", "fontWeight": "800"}),
+                        # html.Div(id="metric-avg-progress", style={"fontSize": "28px", "fontWeight": "900", "color": "#111827"}),
                     ], style={"backgroundColor": "#fef3c7", "padding": "16px", "borderRadius": "12px"}),
                 ], xs=12, sm=6, md=6, lg=6),
                 dbc.Col([
                     html.Div([
-                        html.Div("Avg playback time", style={"fontSize": "12px", "color": "#ec4899", "fontWeight": "800"}),
-                        html.Div(id="metric-playback-time", style={"fontSize": "28px", "fontWeight": "900", "color": "#111827"}),
+                        html.Div("Total consumption playback time", style={"fontSize": "12px", "color": "#ec4899", "fontWeight": "800"}),
+                        html.Div(id="metric-total-consumption-playback-time", style={"fontSize": "28px", "fontWeight": "900", "color": "#111827"}),
+
+                        # html.Div("Avg playback time", style={"fontSize": "12px", "color": "#ec4899", "fontWeight": "800"}),
+                        # html.Div(id="metric-playback-time", style={"fontSize": "28px", "fontWeight": "900", "color": "#111827"}),
                     ], style={"backgroundColor": "#fce7f3", "padding": "16px", "borderRadius": "12px"}),
                 ], xs=12, sm=6, md=6, lg=6),
             ], className="g-2"),
@@ -1309,8 +1331,10 @@ def update_user_counts(options):
         Output("metric-total-contents", "children"),
         Output("metric-words-uploaded", "children"),
         Output("metric-words-completed", "children"),
-        Output("metric-avg-progress", "children"),
-        Output("metric-playback-time", "children"),
+        Output("metric-total-playback-percentage", "children"),
+        # Output("metric-avg-progress", "children"),
+        Output("metric-total-consumption-playback-time", "children"),
+        # Output("metric-playback-time", "children"),
         Output("content-table-container", "children"),
         Output("session-timeline", "figure"),
         Output("date-range-text", "children"),
@@ -1394,7 +1418,9 @@ def update_dashboard(user_id, date_range, custom_start, custom_end, content_date
     first_event_str = first_event.strftime("%b %d, %Y") if pd.notna(first_event) else "N/A"
     last_seen_str = last_event.strftime("%b %d, %Y, %H:%M UTC") if pd.notna(last_event) else "N/A"
 
-    total_sessions = int(scope_df["properties.Session ID"].nunique()) if "properties.Session ID" in scope_df.columns else 0
+    session_col = get_session_id_col(scope_df)
+    total_sessions = int(scope_df[session_col].nunique()) if session_col else 0
+
     active_days = int(scope_df["date"].nunique()) if "date" in scope_df.columns else 0
     total_events = int(len(scope_df))
 
@@ -1504,8 +1530,10 @@ def update_dashboard(user_id, date_range, custom_start, custom_end, content_date
         str(content_metrics["total_contents"]),
         words_uploaded_display,
         content_metrics["total_words_completed"],
-        f"{content_metrics['avg_progress']}%",
-        f"{content_metrics['avg_playback_time']} min",
+        f"{content_metrics["total_playback_percentage"]}%",
+        f"{content_metrics["total_consumption_playback_time"]} min",
+        # f"{content_metrics['avg_progress']}%",
+        # f"{content_metrics['avg_playback_time']} min",
         content_table,
         fig,
         date_range_text,
@@ -1563,7 +1591,12 @@ def show_content_details(selected_content_id, current_user_value, date_filter, e
 
     scope_df, _ = get_scope_df(df, current_user_value)
 
-    history_df, summary = get_content_history(scope_df, selected_content_id, date_filter)
+    history_df, summary = get_content_history(
+    scope_df, 
+    selected_content_id, 
+    date_filter, 
+    global_max_date=max_date_data 
+)
     if len(history_df) == 0:
         return html.Div()
 
@@ -1730,7 +1763,13 @@ def display_session_details(clickData, current_user_value, env_value):
         content_html = []
         if session["content_played"]:
             for content in session["content_played"]:
-                listen_url = f"https://helloella-prod.web.app/listen/{content['content_id']}"
+                if env_value == "prod":
+                    base_listen_url = "https://helloella-prod.web.app"
+                else:
+                    base_listen_url = "https://helloella-test.web.app"
+
+                # 2. Construct the final URL
+                listen_url = f"{base_listen_url}/listen/{content['content_id']}"
                 change = content["progress_change"]
                 if change > 0:
                     change_color = "#16a34a"
