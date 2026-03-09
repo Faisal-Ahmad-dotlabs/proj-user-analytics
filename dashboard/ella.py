@@ -19,7 +19,11 @@ def _prepare_headers(env: str) -> dict[str, str]:
     else:
         token = settings.ELLA_KEY_PROD.get_secret_value()
 
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = {
+    "Authorization": f"Bearer {token}",
+    "Content-Type": "application/json",
+    "Accept": "application/json"
+    }
 
     return headers
 
@@ -43,7 +47,7 @@ def fetch_content_details(env: str, content_id: str) -> dict[str, Any]:
     headers = _prepare_headers(env)
 
     try:
-        url = f"{base_url}/{content_id}"
+        url = f"{base_url}/content/{content_id}" 
         r = requests.get(url, headers=headers, timeout=10)
 
         if r.status_code == 200:

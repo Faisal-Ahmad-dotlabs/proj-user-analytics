@@ -23,7 +23,7 @@ def _prepare_headers(env: str) -> dict[str, str]:
     else:
         api_key = settings.MIXPANEL_KEY_TEST.get_secret_value()
     
-    auth = base64.b64encode(f"{api_key}:".encode()).decode()
+    auth = base64.b64encode(f"{api_key}".encode()).decode()
 
     headers = {
         "Authorization": f"Basic {auth}",
@@ -43,7 +43,13 @@ def fetch_mixpanel_data(from_date: str, to_date: str, env: str) -> pd.DataFrame:
     ]
 
     headers = _prepare_headers(env)
-    params = {"from_date": from_date, "to_date": to_date}
+    # Inside mixpanel.py -> fetch_mixpanel_data
+    params = {
+        "from_date": from_date, 
+        "to_date": to_date,
+        "project_id": "3381875" # Use your project ID here
+    }
+
     last_err = None
 
     for url in hosts:
